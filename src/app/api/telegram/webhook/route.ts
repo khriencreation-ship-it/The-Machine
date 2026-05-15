@@ -1,7 +1,7 @@
 import { createClient } from '@/utils/supabase/server'
 import { NextResponse } from 'next/server'
 import { sendTelegramMessage } from '@/utils/telegram'
-import { generateEmbedding, processKnowledge, synthesizeAnswer, extractKnowledgeFromFile } from '@/ai/gemini'
+import { generateEmbedding, processKnowledge, synthesizeAnswer, extractKnowledgeFromFile, brainstormIdea, parseTaskTime } from '@/ai/gemini'
 import { scrapeWebsite } from '@/utils/scraper'
 import { downloadTelegramFile } from '@/utils/telegram_files'
 import fs from 'fs'
@@ -193,8 +193,35 @@ export async function POST(request: Request) {
             .update({ processing_status: 'COMPLETED', processed_at: new Date().toISOString() })
             .eq('id', sourceData.id)
 
+          // 6. Handle Auto-Extracted Action Items
+          let scheduledTasksText = ''
+          if (structuredData.actionItems && structuredData.actionItems.length > 0) {
+            for (const item of structuredData.actionItems) {
+              const taskDesc = item.description
+              // Default to 1 hour from now if no time is implied
+              let eventTime = new Date()
+              eventTime.setHours(eventTime.getHours() + 1)
+              
+              if (item.isoTimestamp) {
+                eventTime = new Date(item.isoTimestamp)
+              }
+              
+              const triggerTime = new Date(eventTime.getTime() - 30 * 60000)
+              const endTime = new Date(eventTime.getTime() + 60 * 60000)
+
+              await supabase.from('tasks').insert([{
+                description: taskDesc,
+                original_time: eventTime.toISOString(),
+                end_time: endTime.toISOString(),
+                trigger_time: triggerTime.toISOString(),
+                is_completed: false
+              }])
+            }
+            scheduledTasksText = `\n\n🎯 <b>Auto-Scheduled ${structuredData.actionItems.length} Action Items</b>`
+          }
+
           if (processingMsgId) {
-            await editReply(processingMsgId, `✅ <b>Media Knowledge Ingested</b>\n\n<b>Title:</b> ${structuredData.title}\n<b>Tags:</b> ${structuredData.tags.join(', ')}`)
+            await editReply(processingMsgId, `✅ <b>Knowledge Ingested</b>\n\n<b>Title:</b> ${structuredData.title}\n<b>Tags:</b> ${structuredData.tags.join(', ')}${scheduledTasksText}`)
           }
         } catch (error: any) {
           console.error('File Ingestion error:', error)
@@ -274,13 +301,204 @@ export async function POST(request: Request) {
             .update({ processing_status: 'COMPLETED', processed_at: new Date().toISOString() })
             .eq('id', sourceData.id)
 
+          // 6. Handle Auto-Extracted Action Items
+          let scheduledTasksText = ''
+          if (structuredData.actionItems && structuredData.actionItems.length > 0) {
+            for (const item of structuredData.actionItems) {
+              const taskDesc = item.description
+              let eventTime = new Date()
+              eventTime.setHours(eventTime.getHours() + 1)
+              if (item.isoTimestamp) eventTime = new Date(item.isoTimestamp)
+              
+              const triggerTime = new Date(eventTime.getTime() - 30 * 60000)
+              const endTime = new Date(eventTime.getTime() + 60 * 60000)
+
+              await supabase.from('tasks').insert([{
+                description: taskDesc,
+                original_time: eventTime.toISOString(),
+                end_time: endTime.toISOString(),
+                trigger_time: triggerTime.toISOString(),
+                is_completed: false
+              }])
+            }
+            scheduledTasksText = `\n\n🎯 <b>Auto-Scheduled ${structuredData.actionItems.length} Action Items</b>`
+          }
+
           if (processingMsgId) {
-            await editReply(processingMsgId, `✅ <b>Knowledge Ingested</b>\n\n<b>Title:</b> ${structuredData.title}\n<b>Tags:</b> ${structuredData.tags.join(', ')}`)
+            await editReply(processingMsgId, `✅ <b>Knowledge Ingested</b>\n\n<b>Title:</b> ${structuredData.title}\n<b>Tags:</b> ${structuredData.tags.join(', ')}${scheduledTasksText}`)
           }
         } catch (error: any) {
           console.error('Ingestion error:', error)
           if (processingMsgId) await editReply(processingMsgId, `❌ Error ingesting knowledge: ${error.message}`)
         }
+
+      } else if (text.startsWith('/reason ')) {
+        // --- NEW REASONING LOGIC ---
+        const ideaText = text.replace('/reason ', '').trim()
+        if (!ideaText) {
+          await reply('Please provide an idea to reason about. Example: /reason How should we market the new Architect unit?')
+          return NextResponse.json({ status: 'ok' }, { status: 200 })
+        }
+
+        const thinkingMsgId = await reply('🧠 <i>Reasoning...</i>')
+
+        try {
+          // 1. Pull Context
+          const queryEmbedding = await generateEmbedding(ideaText)
+          const { data: matchingMemories, error: matchError } = await supabase
+            .rpc('match_memory_entries', {
+              query_embedding: queryEmbedding,
+              match_threshold: 0.5, 
+              match_count: 5
+            })
+
+          if (matchError) throw matchError
+
+          let contextStr = ''
+          if (matchingMemories && matchingMemories.length > 0) {
+            contextStr = matchingMemories
+              .map((memory: any) => `[Source: ${memory.title}]\n${memory.content.raw_text}`)
+              .join('\n\n')
+          }
+
+          // 2. Brainstorm
+          const answer = await brainstormIdea(ideaText, contextStr)
+
+          if (thinkingMsgId) {
+            await editReply(thinkingMsgId, answer)
+          }
+
+          // 3. Auto-Ingest the Conversation
+          const sessionText = `Reasoning Session:\n\nJake's Prompt:\n${ideaText}\n\nThe Machine's Response:\n${answer}`
+          
+          const { data: sourceData, error: sourceError } = await supabase
+            .from('knowledge_sources')
+            .insert([{ source_name: 'Reasoning Session', source_type: 'reasoning_session', processing_status: 'PROCESSING' }])
+            .select()
+            .single()
+
+          const structuredData = await processKnowledge(sessionText)
+          const sessionEmbedding = await generateEmbedding(sessionText)
+
+          await supabase
+            .from('memory_entries')
+            .insert([{ 
+                title: structuredData.title,
+                summary: structuredData.summary,
+                category: 'REASONING_SESSION',
+                tags: structuredData.tags,
+                content: { raw_text: sessionText },
+                source_type: 'reasoning_session',
+                source_reference: sourceData?.id,
+                embedding: sessionEmbedding
+            }])
+
+          if (sourceData) {
+            await supabase
+              .from('knowledge_sources')
+              .update({ processing_status: 'COMPLETED', processed_at: new Date().toISOString() })
+              .eq('id', sourceData.id)
+          }
+
+          // 4. Handle Auto-Extracted Action Items
+          let scheduledTasksText = ''
+          if (structuredData.actionItems && structuredData.actionItems.length > 0) {
+            for (const item of structuredData.actionItems) {
+              const taskDesc = item.description
+              let eventTime = new Date()
+              eventTime.setHours(eventTime.getHours() + 1)
+              if (item.isoTimestamp) eventTime = new Date(item.isoTimestamp)
+              
+              const triggerTime = new Date(eventTime.getTime() - 30 * 60000)
+              const endTime = new Date(eventTime.getTime() + 60 * 60000)
+
+              await supabase.from('tasks').insert([{
+                description: taskDesc,
+                original_time: eventTime.toISOString(),
+                end_time: endTime.toISOString(),
+                trigger_time: triggerTime.toISOString(),
+                is_completed: false
+              }])
+            }
+            scheduledTasksText = `\n\n🎯 <b>Auto-Scheduled ${structuredData.actionItems.length} Action Items</b>`
+            if (thinkingMsgId) {
+              // Send an extra message for action items since the main message was already sent
+              await reply(scheduledTasksText)
+            }
+          }
+
+        } catch (error: any) {
+          console.error('Reasoning error:', error)
+          if (thinkingMsgId) await editReply(thinkingMsgId, `❌ Error during reasoning: ${error.message}`)
+        }
+
+      } else if (text.startsWith('/task ')) {
+        // --- NEW TASK SCHEDULING LOGIC ---
+        const taskText = text.replace('/task ', '').trim()
+        if (!taskText) {
+          await reply('Please describe the task and time. Example: /task Meeting with dev at 4pm')
+          return NextResponse.json({ status: 'ok' }, { status: 200 })
+        }
+        
+        const thinkingMsgId = await reply('🕒 <i>Scheduling task...</i>')
+        
+        try {
+          const nowLagos = new Date().toLocaleString('en-US', { timeZone: 'Africa/Lagos' })
+          const parsed = await parseTaskTime(taskText, nowLagos)
+          
+          const eventTime = new Date(parsed.isoTimestamp)
+          
+          let endTime = new Date(eventTime.getTime() + 60 * 60000) // Default 1 hour
+          if (parsed.isoEndTime) {
+            endTime = new Date(parsed.isoEndTime)
+          }
+
+          // 30 minutes before
+          const triggerTime = new Date(eventTime.getTime() - 30 * 60000)
+          
+          const { error } = await supabase.from('tasks').insert([{
+            description: parsed.description,
+            original_time: eventTime.toISOString(),
+            end_time: endTime.toISOString(),
+            trigger_time: triggerTime.toISOString(),
+            is_completed: false
+          }])
+          
+          if (error) throw error
+          
+          if (thinkingMsgId) {
+            await editReply(thinkingMsgId, `✅ <b>Task Scheduled</b>\n\n<b>Description:</b> ${parsed.description}\n<b>Event Time:</b> ${eventTime.toLocaleString('en-US', { timeZone: 'Africa/Lagos' })}\n\nI will send you a Voice Note 30 minutes before.`)
+          }
+        } catch (err: any) {
+          console.error('Task parsing error:', err)
+          if (thinkingMsgId) await editReply(thinkingMsgId, `❌ Error scheduling task: ${err.message}`)
+        }
+
+      } else if (text === '/guide' || text === '/help') {
+        const guideText = `
+🤖 <b>The Machine - Official Guide</b>
+
+Here is a list of all commands you can use to manage Khrien's operations:
+
+<b>1. Memory & Knowledge</b>
+• <code>/ingest &lt;text&gt;</code> - Memorize raw text, thoughts, or facts.
+• <code>/ingest &lt;url&gt;</code> - Scrape and memorize a website.
+• Send any <b>PDF, JPG, PNG, or MP4</b> with the caption <code>/ingest</code> - The Brain will extract the text/vision and memorize it.
+
+<b>2. Strategy & Thinking</b>
+• <code>/reason &lt;idea&gt;</code> - Brainstorm an idea. The Brain will pull relevant facts, challenge your idea, and automatically save the conclusion to its memory.
+• <i>(Any normal text)</i> - Ask a question. The Brain will search its memory and answer you.
+
+<b>3. Task Management</b>
+• <code>/task &lt;description&gt; at &lt;time&gt;</code> - Schedule an event (e.g. <i>/task Meeting with dev at 4pm for 1 hr</i>).
+• The Brain will send you an audio Voice Note 30 mins before it starts.
+• When the meeting ends, it will ping you for a debrief.
+
+<b>4. Automation (Action Items)</b>
+• Whenever you use <code>/ingest</code>, <code>/reason</code>, or forward an email, if you imply a promise or TODO (e.g. "I need to call him by 5pm"), The Brain will automatically extract and schedule it as a <code>/task</code>!
+        `
+        await reply(guideText)
+        return NextResponse.json({ status: 'ok' }, { status: 200 })
 
       } else {
         // --- NEW RAG RETRIEVAL LOGIC ---
