@@ -75,3 +75,48 @@ export async function synthesizeAnswer(query: string, context: string) {
   
   return response.text
 }
+
+export async function extractKnowledgeFromFile(filePath: string, mimeType: string) {
+  let uploadResult = null;
+  try {
+    // 1. Upload to Gemini
+    uploadResult = await ai.files.upload({
+      file: filePath,
+      config: { mimeType: mimeType },
+    });
+
+    const prompt = `
+    You are an expert data extraction AI. Analyze this file in detail.
+    Extract all meaningful text, data, core concepts, and context from it.
+    If it is an image or video, describe what is happening and extract any visible text.
+    Return a comprehensive, highly-detailed text summary so I can memorize it for long-term retrieval.
+    `;
+
+    // 2. Generate content
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { fileData: { fileUri: uploadResult.uri, mimeType: uploadResult.mimeType } },
+            { text: prompt }
+          ]
+        }
+      ]
+    });
+
+    if (!response.text) throw new Error("Gemini returned empty response for file extraction.");
+    
+    return response.text;
+  } finally {
+    // 3. Always clean up the file from Google's servers
+    if (uploadResult && uploadResult.name) {
+      try {
+        await ai.files.delete({ name: uploadResult.name });
+      } catch (err) {
+        console.error("Failed to delete file from Gemini:", err);
+      }
+    }
+  }
+}
