@@ -474,6 +474,49 @@ export async function POST(request: Request) {
           if (thinkingMsgId) await editReply(thinkingMsgId, `❌ Error scheduling task: ${err.message}`)
         }
 
+      } else if (text.startsWith('/hunter ')) {
+        // --- NEW HUNTER COMMAND FORWARDING ---
+        const commandText = text.replace('/hunter ', '').trim()
+        if (!commandText) {
+          await reply('Please provide a command for Hunter. Example: /hunter start campaign for fintech')
+          return NextResponse.json({ status: 'ok' }, { status: 200 })
+        }
+
+        const thinkingMsgId = await reply('📡 <i>Relaying command to Hunter Unit...</i>')
+
+        try {
+          const hunterUrl = process.env.HUNTER_URL
+          const unitSecret = process.env.UNIT_SECRET_KEY
+
+          if (!hunterUrl) {
+            throw new Error('HUNTER_URL is not configured in environment variables.')
+          }
+
+          const response = await fetch(`${hunterUrl}/api/commands`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${unitSecret}`
+            },
+            body: JSON.stringify({
+              command: commandText,
+              admin_id: chatId
+            })
+          })
+
+          if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}))
+            throw new Error(errorData.message || `Hunter server returned ${response.status}`)
+          }
+
+          if (thinkingMsgId) {
+            await editReply(thinkingMsgId, `🎯 <b>Command Relayed to Hunter</b>\n\n"${commandText}"\n\nHunter is now processing your request.`)
+          }
+        } catch (error: any) {
+          console.error('Hunter Command error:', error)
+          if (thinkingMsgId) await editReply(thinkingMsgId, `❌ Error relaying command to Hunter: ${error.message}`)
+        }
+
       } else if (text === '/guide' || text === '/help') {
         const guideText = `
 🤖 <b>The Machine - Official Guide</b>
@@ -494,7 +537,10 @@ Here is a list of all commands you can use to manage Khrien's operations:
 • The Brain will send you an audio Voice Note 30 mins before it starts.
 • When the meeting ends, it will ping you for a debrief.
 
-<b>4. Automation (Action Items)</b>
+<b>4. Multi-Agent Commands (Units)</b>
+• <code>/hunter &lt;instruction&gt;</code> - Send a command directly to the Hunter Unit (e.g. <i>/hunter start campaign for SaaS founders</i>).
+
+<b>5. Automation (Action Items)</b>
 • Whenever you use <code>/ingest</code>, <code>/reason</code>, or forward an email, if you imply a promise or TODO (e.g. "I need to call him by 5pm"), The Brain will automatically extract and schedule it as a <code>/task</code>!
         `
         await reply(guideText)
